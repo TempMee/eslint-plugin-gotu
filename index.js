@@ -1,4 +1,4 @@
-const { noMissingDefaultExport } = require('./no-missing-default-export');
+const noMissingDefaultExport = require('./no-missing-default-export');
 
 module.exports = {
   rules: {

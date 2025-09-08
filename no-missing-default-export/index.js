@@ -75,7 +75,7 @@ function isAssetImport(importPath) {
 }
 
 // ESLint rule
-export const noMissingDefaultExport = {
+const noMissingDefaultExport = {
   meta: {
     type: 'problem',
     docs: {
@@ -137,3 +137,5 @@ export const noMissingDefaultExport = {
     };
   },
 };
+
+module.exports = noMissingDefaultExport;
