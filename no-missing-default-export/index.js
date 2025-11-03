@@ -14,7 +14,8 @@ function hasDefaultExport(filePath) {
 
     return (
       /export\s+default\s+/.test(content) ||
-      /export\s*{\s*\w+\s+as\s+default\s*}/.test(content)
+      /export\s*{\s*\w+\s+as\s+default\s*}/.test(content) ||
+      /module\.exports\.default\s*=/.test(content)
     );
   } catch {
     return false;
