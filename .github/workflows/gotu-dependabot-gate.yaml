@@ -1,0 +1,297 @@
+# Fail PRs if there are open critical Dependabot security alerts unless the PR
+# itself upgrades the affected Go module to a patched version.
+#
+# This trusted pull_request_target workflow reads only go.mod files from
+# refs/pull/N/head through GitHub's Contents API. It never checks out or
+# executes pull-request code with privileged access. Unsupported or malformed
+# dependency data remains unresolved (fail closed).
+#
+# Synced by repo-file-sync-action — do not edit directly.
+
+name: Dependabot Gate
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+    branches:
+      - development
+      - staging
+      - production
+      - main
+      - master
+
+permissions:
+  contents: read
+  vulnerability-alerts: read
+
+jobs:
+  check-dependabot-alerts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for open Dependabot alerts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -Eeuo pipefail
+          export LC_ALL=C
+
+          readonly MAX_PAGES=100
+          readonly MAX_ALERTS=500
+          readonly MAX_MANIFEST_BYTES=$((2 * 1024 * 1024))
+          readonly SEMVER_RE='^[vV]?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\+([0-9A-Za-z-]+)(\.([0-9A-Za-z-]+))*)?$'
+          readonly PR_REF="refs/pull/${PR_NUMBER}/head"
+
+          declare -a unresolved_lines=()
+          declare -a unresolved_reasons=()
+          declare -a resolved_lines=()
+
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+
+          sanitize_log_value() {
+            local value="$1"
+            value="${value//$'\r'/ }"
+            value="${value//$'\n'/ }"
+            printf '%s' "$value"
+          }
+
+          alert_line() {
+            local severity ghsa manifest package vulnerable_range version
+            severity=$(sanitize_log_value "$1")
+            ghsa=$(sanitize_log_value "$2")
+            manifest=$(sanitize_log_value "$3")
+            package=$(sanitize_log_value "$4")
+            vulnerable_range=$(sanitize_log_value "$5")
+            version=$(sanitize_log_value "${6:-}")
+
+            severity=$(printf '%s' "$severity" | tr '[:lower:]' '[:upper:]')
+            printf '  - %s | %s | %s %s %s' \
+              "$severity" "$ghsa" "$manifest" "$package" "$vulnerable_range"
+            if [[ -n "$version" ]]; then
+              printf ' -> %s in this PR' "$version"
+            fi
+          }
+
+          add_unresolved() {
+            local index=${#unresolved_lines[@]}
+            unresolved_lines[index]="$1"
+            unresolved_reasons[index]="$2"
+          }
+
+          component_greater() {
+            local left="$1"
+            local right="$2"
+
+            if ((${#left} != ${#right})); then
+              ((${#left} > ${#right}))
+              return
+            fi
+            [[ "$left" > "$right" ]]
+          }
+
+          semver_ge() {
+            local left="$1"
+            local right="$2"
+            local index
+            local -a left_parts right_parts
+
+            if [[ "$left" =~ $SEMVER_RE ]]; then
+              left_parts=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}")
+            else
+              return 2
+            fi
+            if [[ "$right" =~ $SEMVER_RE ]]; then
+              right_parts=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}")
+            else
+              return 2
+            fi
+
+            for index in 0 1 2; do
+              if [[ "${left_parts[index]}" == "${right_parts[index]}" ]]; then
+                continue
+              fi
+              if component_greater "${left_parts[index]}" "${right_parts[index]}"; then
+                return 0
+              fi
+              return 1
+            done
+            return 0
+          }
+
+          [[ "$GH_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || \
+            fail "Invalid GitHub repository name"
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || fail "Invalid pull request number"
+
+          api_error_file=$(mktemp)
+          trap 'rm -f "$api_error_file"' EXIT
+
+          if ! alert_pages=$(gh api --method GET --paginate --slurp \
+            "repos/${GH_REPO}/dependabot/alerts" \
+            -f state=open \
+            -f severity=critical \
+            -F per_page=100 2>"$api_error_file"); then
+            api_error=$(<"$api_error_file")
+            normalized_error=$(printf '%s' "$api_error" | tr '[:upper:]' '[:lower:]')
+            if [[ "$normalized_error" == *"dependabot alerts are disabled"* && \
+              "$normalized_error" == *"http 404"* ]]; then
+              echo "::warning::Dependabot alerts are not enabled on ${GH_REPO}; nothing to gate."
+              exit 0
+            fi
+            fail "Dependabot alert query failed; failing closed"
+          fi
+
+          if ! alerts=$(jq -ce --argjson max_pages "$MAX_PAGES" '
+            if type != "array" or any(.[]; type != "array") then
+              error("GitHub returned malformed pagination data")
+            elif length > $max_pages then
+              error("GitHub pagination exceeded the safety limit")
+            else
+              [.[][]]
+            end
+          ' <<<"$alert_pages"); then
+            fail "Dependabot alert response was malformed; failing closed"
+          fi
+
+          alert_count=$(jq -r 'length' <<<"$alerts")
+          ((alert_count <= MAX_ALERTS)) || \
+            fail "Dependabot alert count exceeded the safety limit; failing closed"
+          if ((alert_count == 0)); then
+            echo "No open critical Dependabot alerts. Passing."
+            exit 0
+          fi
+
+          if ! encoded_alerts=$(jq -r '.[] | @base64' <<<"$alerts"); then
+            fail "Dependabot alert response could not be decoded; failing closed"
+          fi
+
+          for encoded_alert in $encoded_alerts; do
+            if ! alert=$(printf '%s' "$encoded_alert" | base64 -d 2>"$api_error_file"); then
+              add_unresolved "  - CRITICAL | malformed alert metadata" \
+                "alert metadata could not be decoded"
+              continue
+            fi
+
+            if ! severity=$(jq -er '.security_advisory.severity | strings | select(length > 0)' <<<"$alert") || \
+              ! ghsa=$(jq -er '.security_advisory.ghsa_id | strings | select(length > 0)' <<<"$alert") || \
+              ! package=$(jq -er '.dependency.package.name | strings | select(length > 0)' <<<"$alert") || \
+              ! ecosystem=$(jq -er '.dependency.package.ecosystem | strings | select(length > 0)' <<<"$alert") || \
+              ! manifest=$(jq -er '.dependency.manifest_path | strings | select(length > 0)' <<<"$alert"); then
+              add_unresolved "  - CRITICAL | malformed alert metadata" \
+                "alert metadata is incomplete"
+              continue
+            fi
+            vulnerable_range=$(jq -r \
+              '.security_vulnerability.vulnerable_version_range // "unknown"' <<<"$alert")
+            line=$(alert_line "$severity" "$ghsa" "$manifest" "$package" "$vulnerable_range")
+
+            if ! patched=$(jq -er \
+              '.security_vulnerability.first_patched_version.identifier | strings | select(length > 0)' \
+              <<<"$alert"); then
+              add_unresolved "$line" "no patched version is published"
+              continue
+            fi
+
+            case "$ecosystem" in
+              go | Go | GO) ;;
+              *)
+                add_unresolved "$line" "package ecosystem is unsupported"
+                continue
+                ;;
+            esac
+            if [[ ! "$package" =~ ^[A-Za-z0-9._~+/-]+$ ]]; then
+              add_unresolved "$line" "package name is unsupported"
+              continue
+            fi
+            if [[ ! "$manifest" =~ ^([A-Za-z0-9._-]+/)*go\.mod$ || \
+              "/$manifest/" == *"/../"* || "/$manifest/" == *"/./"* ]]; then
+              add_unresolved "$line" "manifest path is unsupported or unsafe"
+              continue
+            fi
+
+            if ! manifest_response=$(gh api --method GET \
+              "repos/${GH_REPO}/contents/${manifest}" \
+              -f ref="$PR_REF" 2>"$api_error_file"); then
+              add_unresolved "$line" "manifest is unavailable"
+              continue
+            fi
+            if ! manifest_base64=$(jq -er --argjson max_bytes "$MAX_MANIFEST_BYTES" '
+              if .type == "file" and .encoding == "base64" and
+                (.size | type) == "number" and .size <= $max_bytes and
+                (.content | type) == "string"
+              then .content
+              else error("manifest response is invalid")
+              end
+            ' <<<"$manifest_response"); then
+              add_unresolved "$line" "manifest response is invalid"
+              continue
+            fi
+            if ! manifest_content=$(printf '%s' "$manifest_base64" | \
+              tr -d '\r\n' | base64 -d 2>"$api_error_file"); then
+              add_unresolved "$line" "manifest content is invalid"
+              continue
+            fi
+
+            proposed=$(awk -v wanted="$package" '
+              {
+                sub(/\/\/.*/, "")
+              }
+              $1 == "require" && $2 == "(" {
+                in_require = 1
+                next
+              }
+              in_require && $1 == ")" {
+                in_require = 0
+                next
+              }
+              in_require && $1 == wanted {
+                print $2
+                exit
+              }
+              !in_require && $1 == "require" && $2 == wanted {
+                print $3
+                exit
+              }
+            ' <<<"$manifest_content")
+            if [[ -z "$proposed" ]]; then
+              add_unresolved "$line" "package is not pinned in the PR manifest"
+              continue
+            fi
+
+            if semver_ge "$proposed" "$patched"; then
+              resolved_lines[${#resolved_lines[@]}]=$(alert_line \
+                "$severity" "$ghsa" "$manifest" "$package" "$vulnerable_range" "$proposed")
+              continue
+            else
+              comparison_status=$?
+            fi
+            if ((comparison_status == 2)); then
+              add_unresolved "$line" "version is not stable SemVer"
+            else
+              add_unresolved "$line" "proposed version ${proposed} is vulnerable"
+            fi
+          done
+
+          classified_count=$((${#resolved_lines[@]} + ${#unresolved_lines[@]}))
+          ((classified_count == alert_count)) || \
+            fail "Not every Dependabot alert was classified; failing closed"
+
+          if ((${#resolved_lines[@]} > 0)); then
+            echo "Alert(s) resolved by this PR's manifest (not counted against the gate):"
+            printf '%s\n' "${resolved_lines[@]}"
+          fi
+
+          if ((${#unresolved_lines[@]} == 0)); then
+            echo "All ${alert_count} open critical alert(s) are resolved by this PR. Passing."
+            exit 0
+          fi
+
+          echo "::error::${#unresolved_lines[@]} critical Dependabot alert(s) remain unresolved:"
+          for index in "${!unresolved_lines[@]}"; do
+            echo "${unresolved_lines[index]}"
+            echo "    reason: ${unresolved_reasons[index]}"
+          done
+          exit 1
